@@ -1,0 +1,257 @@
+services:
+  # --------------------
+  # Zookeeper
+  # --------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo 'ruok' | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - confluent
+
+  # --------------------
+  # Kafka Broker
+  # --------------------
+  broker:
+    image: confluentinc/cp-server:7.4.0
+    hostname: broker
+    container_name: broker
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+    healthcheck:
+      test: ["CMD", "bash", "-c", "nc -z localhost 9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - confluent
+
+  # --------------------
+  # Schema Registry
+  # --------------------
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.4.0
+    hostname: schema-registry
+    container_name: schema-registry
+    depends_on:
+      broker:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: broker:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - confluent
+
+  # --------------------
+  # Control Center
+  # --------------------
+  control-center:
+    image: confluentinc/cp-enterprise-control-center:7.4.0
+    hostname: control-center
+    container_name: control-center
+    depends_on:
+      broker:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "9021:9021"
+    environment:
+      CONTROL_CENTER_BOOTSTRAP_SERVERS: broker:29092
+      CONTROL_CENTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONTROL_CENTER_REPLICATION_FACTOR: 1
+      CONFLUENT_METRICS_ENABLE: 'false'
+      PORT: 9021
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9021/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - confluent
+
+  # --------------------
+  # Airflow Webserver
+  # --------------------
+  webserver:
+    image: apache/airflow:2.7.0-python3.9
+    container_name: airflow_webserver
+    depends_on:
+      - postgres
+    environment:
+      LOAD_EX: 'n'
+      EXECUTOR: Sequential
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW_WEBSERVER_SECRET_KEY: this_is_a_very_secured_key
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./script/entrypoint.sh:/opt/airflow/script/entrypoint.sh
+      - ./requirements.txt:/opt/airflow/requirements.txt
+    ports:
+      - "8080:8080"
+    entrypoint: /opt/airflow/script/entrypoint.sh
+    command: airflow webserver
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+    networks:
+      - confluent
+
+  # --------------------
+  # Airflow Scheduler
+  # --------------------
+  scheduler:
+    image: apache/airflow:2.7.0-python3.9
+    container_name: airflow_scheduler
+    depends_on:
+      postgres:
+        condition: service_started
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW_WEBSERVER_SECRET_KEY: this_is_a_very_secured_key
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./script/entrypoint.sh:/opt/airflow/script/entrypoint.sh
+      - ./requirements.txt:/opt/airflow/requirements.txt
+      - airflow-logs:/opt/airflow/logs
+    entrypoint: /opt/airflow/script/entrypoint.sh
+    command: >
+      bash -c "
+      airflow db upgrade &&
+      airflow scheduler"
+    networks:
+      - confluent
+
+  # --------------------
+  # Airflow Postgres
+  # --------------------
+  postgres:
+    image: postgres:14.0
+    container_name: airflow_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    networks:
+      - confluent
+
+  # --------------------
+  # Spark Master
+  # --------------------
+  spark-master:
+    image: apache/spark:3.5.8-scala2.12-java11-python3-r-ubuntu
+    container_name: spark-master
+    user: root
+    hostname: spark-master
+    restart: unless-stopped
+    ports:
+      - "7077:7077"   # Spark master service
+      - "18080:8080"  # Spark master Web UI
+    command: bash -c "ln -sf /usr/bin/python3 /usr/bin/python && /opt/spark/sbin/start-master.sh && tail -f /dev/null"
+    networks:
+      - confluent
+
+  # --------------------
+  # Spark Worker
+  # --------------------
+  spark-worker:
+    image: apache/spark:3.5.8-scala2.12-java11-python3-r-ubuntu
+    container_name: spark-worker
+    user: root
+    command: bash -c "ln -sf /usr/bin/python3 /usr/bin/python && pip install cassandra-driver && /opt/spark/sbin/start-worker.sh spark://spark-master:7077 && sleep 5 && /opt/spark/bin/spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.8 /opt/app/spark_stream.py && tail -f /dev/null"
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 3g
+    networks:
+      - confluent
+    volumes:
+    - /mnt/d/Projects/Data Streaming/spark_stream.py:/opt/app/spark_stream.py  
+
+  # --------------------
+  # Cassandra
+  # --------------------
+  cassandra_db:
+    image: cassandra:latest
+    container_name: cassandra
+    hostname: cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 100M
+      CASSANDRA_USERNAME: cassandra
+      CASSANDRA_PASSWORD: cassandra
+    networks:
+      - confluent
+
+  pyspark-client:
+    image: apache/spark:3.5.8-scala2.12-java11-python3-r-ubuntu
+    container_name: pyspark-client
+    volumes:
+      - ./dags:/app   # your script folder
+    working_dir: /app
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      CASSANDRA_HOST: cassandra
+      KAFKA_BOOTSTRAP_SERVERS: broker:29092
+    depends_on:
+      - spark-master
+      - cassandra_db
+      - broker
+    networks:
+      - confluent
+    tty: true
+    stdin_open: true
+    command: bash
+
+# --------------------
+# Networks
+# --------------------
+networks:
+  confluent:
+
+volumes:
+  kafka-data:
+  airflow-logs:
+  airflow-postgres-data:
+
+
+#spark-submit --master spark://spark-master:7077 --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.2 spark_stream.py
+#docker exec spark-worker bash -c "timeout 1 bash -c '</dev/tcp/cassandra/9042' && echo 'Cassandra reachable' || echo 'Cannot reach Cassandra'"
